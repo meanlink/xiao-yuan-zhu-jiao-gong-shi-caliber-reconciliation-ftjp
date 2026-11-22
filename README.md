@@ -23,6 +23,10 @@
 
 - 签到时间必须落在课程排班窗口前后 30 分钟的容差内，且签到日期必须与课程排班星期匹配。
 - 签到与排班冲突时，记录状态为 `manual_review`，教师不能直接审批，必须由学院管理员复核后再进入审批。
+- 同一助教在不同学院的签到时段真实重叠时，并发审批也只有一笔进入计薪（`approved`），另一笔转为 `adjudication_pending` 并由冲突案例留痕，留待学院管理员裁决。
+- 学院管理员可填理由改选计薪方：所选记录升为 `approved`、另一笔降为 `adjudication_pending`，同一事务内重算涉及学院的月报预览，两院结果一起更新；任一步失败整体回滚，原决定保持不变。
+- 裁决接口支持 `Idempotency-Key`（或请求体 `idempotency_key`）：回执丢失时重试返回原回执并标记 `replayed`，不重复记账；若之后已有新裁决，重试返回 `superseded: true` 与当前赢家，不覆盖后来的决定。`expected_version` 不一致时返回 409 并保留现状。
+- 审批与月报页面展示冲突的两笔记录、各自学院与有效工时、当前计薪方，以及每次裁决的操作人、所选记录和理由。
 - 未审核工时的 `validated_hours` 不计入学院月报。
 - 课程班月报只能由学院管理员生成，发布前会重新按数据库中的 `approved` 记录计算。
 
@@ -73,12 +77,20 @@ docker compose down -v --remove-orphans
 ## 共享枚举出现位置
 
 - `WorkRecordStatus` 出现在 `backend/src/constants/enums.py`、`backend/src/schemas/work_records.py`、`frontend/src/constants/enums.js`。
+- `AdjudicationCaseStatus` 出现在 `backend/src/constants/enums.py`、`frontend/src/constants/enums.js`。
 - `UserRole` 出现在 `backend/src/constants/enums.py`、`backend/src/schemas/auth.py`、`frontend/src/constants/enums.js`。
 - `ApprovalSheetStatus` 出现在 `backend/src/constants/enums.py`、`backend/src/schemas/reports.py`、`frontend/src/constants/enums.js`。
 
 ## 复现算法
 
 工时有效值由 `min(签到签退实际分钟 / 60, 助教填报小时, 课程班单次口径上限)` 计算，四舍五入到 0.25 小时。排班冲突条件、缺签条件和有效小时口径写在 `backend/src/services/hour_policy.py`。月报透视按 `department × course_class × activity_type × ta` 聚合已审批记录，结果带 `approved_record_count`，便于财务复核。
+
+跨学院重叠判定与裁决状态机写在 `backend/src/services/adjudication.py`：以 `ta_id` 的 PostgreSQL 事务级 advisory lock 串行化同一助教的审批与裁决，重叠加锁后重新读取状态，确保并发审批只有一笔计薪；冲突对按记录 id 归一化存入 `adjudication_cases`，每次改选连同理由、操作人与幂等键写入 `adjudication_decisions`。
+
+- `GET /adjudications`、`GET /adjudications/{id}`：按角色可见范围返回冲突两笔记录、月报预览与全部裁决历史。
+- `POST /adjudications/{id}/decisions`：学院管理员改选计薪方，`Idempotency-Key` 请求头（或 `idempotency_key` 字段）保障安全重试，`expected_version` 做乐观并发校验。
+
+集成测试：`backend/tests/test_adjudication.py`（需本地 PostgreSQL，`DATABASE_URL` 指向可清空的测试库，`PYTHONPATH=backend pytest backend/tests`）。
 
 ## License
 

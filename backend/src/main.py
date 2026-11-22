@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .db import init_db
 from .middlewares.rate_limit import rate_limit_middleware
 from .middlewares.errors import error_middleware
-from .routes import auth, classes, work_records, reports, dashboard, audit
+from .routes import auth, classes, work_records, reports, dashboard, audit, adjudications
 from .services.auth_service import ensure_users
 
 app = FastAPI(title="Campus TA Hours", version="1.0.0")
@@ -26,3 +26,4 @@ app.include_router(work_records.router)
 app.include_router(reports.router)
 app.include_router(dashboard.router)
 app.include_router(audit.router)
+app.include_router(adjudications.router)

@@ -3,7 +3,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..db import get_conn
 from ..schemas.work_records import WorkRecordCreate, ReviewRequest
 from ..services.hour_policy import validate_work_hours
-from ..services.audit import record_audit
+from ..services.audit import record_audit, record_audit_conn
+from ..services import adjudication
 from .deps import current_user, require_roles
 
 router = APIRouter(prefix="/work-records", tags=["work-records"])
@@ -54,24 +55,53 @@ def review_record(record_id: int, payload: ReviewRequest, user=Depends(require_r
             raise HTTPException(status_code=404, detail="工时记录不存在")
         if user["role"] == "teacher" and row["class_teacher_id"] != user["id"]:
             raise HTTPException(status_code=403, detail="教师只能处理自己课程班的工时")
+        # 锁住该助教，再重新读取；并发审批同一助教的重叠记录时只会有一笔进入计薪。
+        adjudication.lock_ta(conn, row["ta_id"])
+        row = conn.execute(LIST_SQL + " WHERE w.id=%s", (record_id,)).fetchone()
         if row["status"] == "approved":
             raise HTTPException(status_code=409, detail="已审批记录不能重复处理")
-        new_status = "manual_review" if row["status"] == "manual_review" else "approved"
-        note = payload.note or ("学院管理员已复核签到冲突" if new_status == "approved" else "")
-        conn.execute("UPDATE work_records SET status=%s, review_note=%s, teacher_id=%s, reviewed_at=now(), updated_at=now() WHERE id=%s", (new_status, note, user["id"], record_id))
-    record_audit(user["id"], "work_record_reviewed", "work_record", record_id, {"status": new_status, "note": note})
-    return {"id": record_id, "status": new_status, "message": "记录已审批，现可计入学院月报" if new_status == "approved" else "记录保留为人工复核"}
+        if row["status"] == "adjudication_pending":
+            # 并发审批时后到的请求命中同一冲突对：结果一致，保留待裁决，不视为失败。
+            case = adjudication.find_case_for_record(conn, record_id)
+            return {
+                "id": record_id,
+                "status": "adjudication_pending",
+                "case_id": case["id"] if case else None,
+                "message": "该记录与其他学院记录时段重叠，留待学院管理员裁决",
+            }
+        if row["status"] == "manual_review":
+            note = payload.note or ""
+            conn.execute("UPDATE work_records SET status='manual_review', review_note=%s, teacher_id=%s, reviewed_at=now(), updated_at=now() WHERE id=%s", (note, user["id"], record_id))
+            record_audit_conn(conn, user["id"], "work_record_reviewed", "work_record", record_id, {"status": "manual_review", "note": note})
+            return {"id": record_id, "status": "manual_review", "message": "记录保留为人工复核"}
+        if row["status"] != "submitted":
+            raise HTTPException(status_code=409, detail="当前状态不可审批")
+        note = payload.note or "任课教师核对签到与工作说明后审批"
+        result = adjudication.apply_approval(conn, row, user["id"], note)
+    if result["status"] == "approved":
+        message = "记录已审批，现可计入学院月报"
+        if result["blocked_records"]:
+            message += f"；同时有 {len(result['blocked_records'])} 笔重叠记录转入学院裁决"
+    else:
+        message = result["message"]
+    return {**result, "message": message}
 
 @router.post("/{record_id}/resolve-conflict")
 def resolve_conflict(record_id: int, payload: ReviewRequest, user=Depends(require_roles("college_admin"))):
     with get_conn() as conn:
-        row = conn.execute("""SELECT w.id,w.status,w.reported_hours,c.expected_hours
+        row = conn.execute("""SELECT w.id,w.ta_id,w.status,w.reported_hours,c.expected_hours
             FROM work_records w JOIN course_classes c ON c.id=w.class_id WHERE w.id=%s""", (record_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="工时记录不存在")
+        adjudication.lock_ta(conn, row["ta_id"])
+        row = conn.execute("""SELECT w.id,w.ta_id,w.status,w.reported_hours,c.expected_hours
+            FROM work_records w JOIN course_classes c ON c.id=w.class_id WHERE w.id=%s""", (record_id,)).fetchone()
+        if row["status"] == "adjudication_pending":
+            raise HTTPException(status_code=409, detail="重叠记录只能通过冲突裁决改选计薪方")
         if row["status"] != "manual_review":
             raise HTTPException(status_code=409, detail="当前记录不在人工复核状态")
+        note = payload.note or "学院管理员复核签到与排班后转教师审批"
         conn.execute("""UPDATE work_records SET status='submitted', validated_hours=LEAST(reported_hours, (SELECT expected_hours FROM course_classes WHERE id=work_records.class_id)),
-            review_note=%s, updated_at=now() WHERE id=%s""", (payload.note or "学院管理员复核签到与排班后转教师审批", record_id))
-    record_audit(user["id"], "attendance_conflict_resolved", "work_record", record_id, {"note": payload.note})
+            review_note=%s, updated_at=now() WHERE id=%s""", (note, record_id))
+        record_audit_conn(conn, user["id"], "attendance_conflict_resolved", "work_record", record_id, {"note": payload.note})
     return {"id": record_id, "status": "submitted"}
