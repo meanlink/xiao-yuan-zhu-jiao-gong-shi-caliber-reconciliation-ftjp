@@ -1,0 +1,103 @@
+name: campus-ta-hours
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-campus-ta-hours}-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-campus_hours}
+      POSTGRES_USER: ${POSTGRES_USER:-campus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-campus123}
+    ports:
+      - "${DB_PORT:-17754}:5432"
+    volumes:
+      - campus_ta_hours_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-campus} -d ${POSTGRES_DB:-campus_hours}"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-campus-ta-hours}-redis
+    volumes:
+      - campus_ta_hours_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-campus-ta-hours}-backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://campus:campus123@db:5432/campus_hours}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      JWT_SECRET: ${JWT_SECRET:-campus-ta-hours-secret}
+      SEED_DEMO: ${SEED_DEMO:-true}
+      SHARED_DIR: /shared
+    ports:
+      - "${BACKEND_PORT:-19254}:8000"
+    volumes:
+      - campus_ta_hours_shared:/shared
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)\""]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-campus-ta-hours}-worker
+    command: ["python", "-m", "src.worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://campus:campus123@db:5432/campus_hours}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SHARED_DIR: /shared
+    volumes:
+      - campus_ta_hours_shared:/shared
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /shared/worker-heartbeat && test $$(($$(date +%s)-$$(stat -c %Y /shared/worker-heartbeat))) -lt 30"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-campus-ta-hours}-frontend
+    ports:
+      - "${FRONTEND_PORT:-18254}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+volumes:
+  campus_ta_hours_db:
+    name: campus_ta_hours_db
+  campus_ta_hours_redis:
+    name: campus_ta_hours_redis
+  campus_ta_hours_shared:
+    name: campus_ta_hours_shared
